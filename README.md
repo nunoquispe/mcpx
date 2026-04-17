@@ -6,6 +6,7 @@ Fast MCP config manager for self-hosted Model Context Protocol servers.
 mcpx +pg +ssh-d        add MCPs to .mcp.json (fuzzy match)
 mcpx -pg               remove
 mcpx scan              discover live MCPs on your network
+mcpx +dev              add a whole profile at once
 ```
 
 ## Why mcpx?
@@ -16,17 +17,19 @@ Tools like [mcpm](https://mcpm.sh) and [mcp-get](https://github.com/michaellatma
 
 - **Private catalog** — your own registry of self-hosted MCPs
 - **Fuzzy matching** — `pg` → `pg-enterprise`, `ssh-d` → `ssh-dev`
-- **Port scanning** — discover live MCPs across your network
+- **Port scanning** — discover live MCPs with server info and tool lists
+- **Profiles** — group MCPs and add/remove them as a set
+- **Multi-client sync** — auto-sync to Codex (and more coming)
 - **Zero dependencies** — just bash, jq, and curl
 
 ## Install
 
 ```bash
-# Option 1: curl
-curl -fsSL https://raw.githubusercontent.com/nunoquispe/mcpx/main/install.sh | bash
-
-# Option 2: Homebrew
+# Option 1: Homebrew
 brew install nunoquispe/tap/mcpx
+
+# Option 2: curl
+curl -fsSL https://raw.githubusercontent.com/nunoquispe/mcpx/main/install.sh | bash
 
 # Option 3: manual
 curl -fsSL https://raw.githubusercontent.com/nunoquispe/mcpx/main/mcpx -o /usr/local/bin/mcpx
@@ -43,18 +46,23 @@ mcpx init
 # → Host name: mini
 # → Host address: 192.168.1.50
 # → Port range: 3200-3250
+# → Sync to Codex? Y
 
 # 2. Scan for live MCPs
 mcpx scan
-#   * :3201 mysql-enterprise
-#   * :3202 pg-enterprise
-#   ? :3205 (not in catalog)
+#   * :3201 mysql-mcp-server v0.1.0  7t [mysql_query,mysql_write,...]
+#   * :3202 pg-mcp-server v0.1.0     3t [pg_query,pg_exec_func,pg_to_s3]
+#   ? :3205 duckdb-files v0.1.0      3t [duckdb_file_query,...]
 
 # 3. Register unknown MCPs
 mcpx @duckdb 3205
 
-# 4. Add MCPs to your project's .mcp.json
+# 4. Add MCPs to your project
 mcpx +pg +mysql
+
+# 5. Save a profile for reuse
+mcpx :save dev pg ssh-d git deploy
+mcpx +dev    # add all 4 at once next time
 ```
 
 ## Usage
@@ -70,6 +78,19 @@ mcpx +aws -hana        # mix add/remove in one shot
 mcpx 0                 # truncate to empty
 ```
 
+### Profiles
+
+```bash
+mcpx :save dev pg ssh-d git   # save profile "dev"
+mcpx :save obs aws cloud      # save profile "obs"
+mcpx :ls                       # list profiles
+mcpx +dev                      # add all MCPs in profile
+mcpx -dev                      # remove all MCPs in profile
+mcpx :rm dev                   # delete profile
+```
+
+Profiles are checked before the catalog, so `+dev` expands the profile if it exists, otherwise fuzzy-matches against the catalog.
+
 ### Catalog management
 
 ```bash
@@ -82,17 +103,33 @@ mcpx @my-server        # remove from catalog
 ### Discovery
 
 ```bash
-mcpx scan              # scan default host
+mcpx scan              # scan default host (with MCP protocol probe)
 mcpx scan staging      # scan a specific host
 ```
+
+Scan does a 2-phase discovery:
+1. Parallel HTTP probe across the port range
+2. MCP protocol handshake on live ports to get server name, version, and tool list
 
 ### Multi-host
 
 ```bash
-mcpx hosts                          # list hosts
-mcpx host add staging 10.0.0.5     # add host (default port range 3200-3250)
-mcpx host add prod 10.0.0.6 8000 8050  # custom port range
+mcpx hosts                             # list hosts
+mcpx host add staging 10.0.0.5        # add host (default port range 3200-3250)
+mcpx host add prod 10.0.0.6 8000 8050 # custom port range
 ```
+
+### Sync
+
+Auto-sync your `.mcp.json` to other AI coding tools:
+
+```bash
+mcpx sync                # show sync status
+mcpx sync codex true     # enable auto-sync to ~/.codex/config.toml
+mcpx sync codex false    # disable
+```
+
+When enabled, every `+`, `-`, and `0` operation automatically updates the target config.
 
 ## Fuzzy matching
 
@@ -111,8 +148,9 @@ Config lives in `~/.config/mcpx/` (override with `MCPX_CONFIG_DIR`):
 
 ```
 ~/.config/mcpx/
-├── config.json     # hosts and settings
-└── catalog.json    # your MCP registry
+├── config.json      # hosts, sync settings
+├── catalog.json     # your MCP registry
+└── profiles.json    # saved MCP groups
 ```
 
 ### config.json
@@ -126,6 +164,9 @@ Config lives in `~/.config/mcpx/` (override with `MCPX_CONFIG_DIR`):
       "port_min": 3200,
       "port_max": 3250
     }
+  },
+  "sync": {
+    "codex": true
   }
 }
 ```
@@ -143,16 +184,38 @@ Config lives in `~/.config/mcpx/` (override with `MCPX_CONFIG_DIR`):
 }
 ```
 
+## Project structure
+
+```
+mcpx/
+├── mcpx             # distributable script (built from lib/)
+├── build.sh         # assembles lib/*.sh → mcpx
+├── lib/
+│   ├── core.sh      # constants, colors, helpers
+│   ├── fuzzy.sh     # fuzzy name matching
+│   ├── sync.sh      # auto-sync to external clients
+│   ├── config.sh    # init, hosts, load_host
+│   ├── profiles.sh  # profile management
+│   ├── catalog.sh   # show, list, add, remove, catalog mod
+│   └── scan.sh      # port scanning and MCP discovery
+├── install.sh       # curl installer
+├── README.md
+└── LICENSE
+```
+
+Development: edit files in `lib/`, then run `./build.sh` to rebuild the distributable `mcpx`.
+
 ## How it works
 
-mcpx manages two things:
+mcpx manages three things:
 
-1. **Catalog** (`~/.config/mcpx/catalog.json`) — your private registry of all available MCPs
-2. **Project config** (`.mcp.json` in cwd) — which MCPs are active for this project
+1. **Catalog** (`catalog.json`) — your private registry of all available MCPs
+2. **Profiles** (`profiles.json`) — named groups of MCPs for batch operations
+3. **Project config** (`.mcp.json` in cwd) — which MCPs are active for this project
 
-`mcpx +name` copies an entry from the catalog into your project's `.mcp.json`. That's it — no daemons, no lock files, no magic.
+`mcpx +name` copies an entry from the catalog into your project's `.mcp.json`. If sync targets are enabled, it also updates their configs. That's it — no daemons, no lock files, no magic.
 
-`mcpx scan` does parallel HTTP probes across a port range to find live MCP servers, then shows which ones are already in your catalog.
+`mcpx scan` does parallel HTTP probes across a port range, then performs MCP protocol handshakes on live ports to get server names, versions, and tool inventories.
 
 ## License
 

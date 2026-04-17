@@ -11,16 +11,26 @@
 #   mcpx 0                   truncate .mcp.json to empty
 #   mcpx @name 3240          add/update entry in catalog
 #   mcpx @name               remove entry from catalog
+#   mcpx :save dev pg ssh-d  save profile
+#   mcpx +dev / -dev         add/remove profile MCPs
 #   mcpx scan [host]         scan host ports for live MCPs
 #   mcpx init                initialize config
 #   mcpx hosts               list configured hosts
+#   mcpx sync                show/set sync targets
 
 set -euo pipefail
 
-VERSION="0.2.0"
+
+# ============================================================
+# lib/core.sh
+# ============================================================
+
+
+VERSION="0.3.0"
 CONFIG_DIR="${MCPX_CONFIG_DIR:-$HOME/.config/mcpx}"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
 CATALOG="${CONFIG_DIR}/catalog.json"
+PROFILES="${CONFIG_DIR}/profiles.json"
 TARGET=".mcp.json"
 
 # Colors
@@ -33,21 +43,100 @@ info() { echo -e "${G}+${N} $1"; }
 warn() { echo -e "${Y}~${N} $1"; }
 dim()  { echo -e "${D}$1${N}"; }
 
-# --- Sync targets ---
+ensure_config_dir() {
+  [[ -d "$CONFIG_DIR" ]] || mkdir -p "$CONFIG_DIR"
+}
+
+ensure_catalog() {
+  [[ -f "$CATALOG" ]] || die "no catalog — run: mcpx init"
+}
+
+ensure_profiles() {
+  ensure_config_dir
+  [[ -f "$PROFILES" ]] || echo '{}' > "$PROFILES"
+}
+
+# Safe JSON file update: write to tmp then move
+json_update() {
+  local file="$1"
+  shift
+  jq "$@" "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+}
+
+# ============================================================
+# lib/fuzzy.sh
+# ============================================================
+
+
+catalog_names() {
+  jq -r '.mcpServers | keys[]' "$CATALOG" | sort
+}
+
+# Generic fuzzy match: exact → prefix → contains
+_fuzzy() {
+  local q="$1"
+  local names="$2"
+
+  # Exact
+  if echo "$names" | grep -qx "$q"; then
+    echo "$q"; return
+  fi
+
+  # Prefix (e.g. "ssh-d" → "ssh-dev")
+  local matches
+  matches=$(echo "$names" | grep "^${q}" || true)
+  if [[ -n "$matches" ]]; then
+    local count
+    count=$(echo "$matches" | wc -l | tr -d ' ')
+    if [[ "$count" -eq 1 ]]; then
+      echo "$matches"; return
+    fi
+  fi
+
+  # Contains (e.g. "duck" → "duckdb-files-enterprise")
+  matches=$(echo "$names" | grep "${q}" || true)
+  if [[ -n "$matches" ]]; then
+    local count
+    count=$(echo "$matches" | wc -l | tr -d ' ')
+    if [[ "$count" -eq 1 ]]; then
+      echo "$matches"; return
+    fi
+    echo -e "${Y}ambiguous:${N} '${q}' matches:" >&2
+    echo "$matches" | sed 's/^/  /' >&2
+    return 1
+  fi
+
+  echo -e "${R}no match:${N} '${q}'" >&2
+  return 1
+}
+
+fuzzy_match() {
+  _fuzzy "$1" "$(catalog_names)"
+}
+
+fuzzy_match_current() {
+  [[ -f "$TARGET" ]] || die "no $TARGET in current directory"
+  local names
+  names=$(jq -r '.mcpServers | keys[]' "$TARGET" 2>/dev/null | sort)
+  [[ -n "$names" ]] || die "$TARGET is empty"
+  _fuzzy "$1" "$names"
+}
+
+# ============================================================
+# lib/sync.sh
+# ============================================================
+
 
 BEGIN_MARKER="# BEGIN MCPX MANAGED MCP SERVERS"
 END_MARKER="# END MCPX MANAGED MCP SERVERS"
-# Also clean up old mcpy markers
 OLD_BEGIN_MARKER="# BEGIN MCPY MANAGED MCP SERVERS"
 OLD_END_MARKER="# END MCPY MANAGED MCP SERVERS"
 
-# Check if a sync target is enabled in config
 sync_enabled() {
   local target="$1"
   [[ -f "$CONFIG_FILE" ]] && jq -e --arg t "$target" '.sync[$t] == true' "$CONFIG_FILE" &>/dev/null
 }
 
-# Remove managed block from a file (handles both MCPX and MCPY markers)
 remove_managed_block() {
   local file="$1" output="$2"
   awk -v b1="$BEGIN_MARKER" -v e1="$END_MARKER" \
@@ -58,7 +147,6 @@ remove_managed_block() {
   ' "$file" > "$output"
 }
 
-# Generate TOML block from current .mcp.json
 generate_codex_toml() {
   [[ -f "$TARGET" ]] || return 0
   local count
@@ -74,7 +162,6 @@ generate_codex_toml() {
   echo "$END_MARKER"
 }
 
-# Sync .mcp.json → ~/.codex/config.toml
 sync_codex() {
   local codex_config="${CODEX_CONFIG:-$HOME/.codex/config.toml}"
   if [[ ! -f "$codex_config" ]]; then
@@ -83,17 +170,12 @@ sync_codex() {
   fi
   [[ -f "$TARGET" ]] || return
 
-  local stripped block tmp
+  local stripped tmp
   stripped=$(mktemp)
   tmp=$(mktemp)
 
-  # Remove old managed block
   remove_managed_block "$codex_config" "$stripped"
-
-  # Build new config: stripped content + managed block
   cp "$stripped" "$tmp"
-
-  # Append new block if there are MCPs
   generate_codex_toml >> "$tmp"
 
   mv "$tmp" "$codex_config"
@@ -104,17 +186,13 @@ sync_codex() {
   echo -e "  ${D}codex${N} ${G}synced${N} ${D}(${count} MCPs → $codex_config)${N}"
 }
 
-# Run all enabled syncs
 auto_sync() {
-  local did_sync=false
   if sync_enabled "codex"; then
     sync_codex
-    did_sync=true
   fi
-  # Future: add more targets here (cursor, windsurf, etc.)
+  # Future: cursor, windsurf, etc.
 }
 
-# Show sync status
 cmd_sync_status() {
   [[ -f "$CONFIG_FILE" ]] || die "not initialized — run: mcpx init"
   echo -e "${B}sync targets${N}"
@@ -134,7 +212,6 @@ cmd_sync_status() {
   done
 }
 
-# Set sync target on/off
 cmd_sync_set() {
   [[ -f "$CONFIG_FILE" ]] || die "not initialized — run: mcpx init"
   local target="$1" value="$2"
@@ -155,17 +232,14 @@ cmd_sync_set() {
   fi
 }
 
-# --- Config ---
+# ============================================================
+# lib/config.sh
+# ============================================================
 
-ensure_config_dir() {
-  [[ -d "$CONFIG_DIR" ]] || mkdir -p "$CONFIG_DIR"
-}
 
 load_host() {
   local host_name="${1:-}"
-  if [[ ! -f "$CONFIG_FILE" ]]; then
-    die "not initialized — run: mcpx init"
-  fi
+  [[ -f "$CONFIG_FILE" ]] || die "not initialized — run: mcpx init"
   if [[ -z "$host_name" ]]; then
     host_name=$(jq -r '.default_host // empty' "$CONFIG_FILE")
     [[ -n "$host_name" ]] || die "no default_host in config"
@@ -224,7 +298,6 @@ cmd_init() {
 }
 EOF
 
-  # Create empty catalog if none exists
   if [[ ! -f "$CATALOG" ]]; then
     echo '{"mcpServers":{}}' > "$CATALOG"
     info "created empty catalog"
@@ -255,88 +328,19 @@ cmd_host_add() {
   [[ -f "$CONFIG_FILE" ]] || die "not initialized — run: mcpx init"
   local name="$1" addr="$2" pmin="${3:-3200}" pmax="${4:-3250}"
 
+  json_update "$CONFIG_FILE" \
+    --arg h "$name" --arg a "$addr" --argjson pmin "$pmin" --argjson pmax "$pmax" \
+    '.hosts[$h] = {address:$a, port_min:$pmin, port_max:$pmax}'
+
   if jq -e --arg h "$name" '.hosts[$h]' "$CONFIG_FILE" &>/dev/null; then
-    # Update existing
-    jq --arg h "$name" --arg a "$addr" --argjson pmin "$pmin" --argjson pmax "$pmax" \
-      '.hosts[$h] = {address:$a, port_min:$pmin, port_max:$pmax}' \
-      "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
-    warn "updated host ${name}"
-  else
-    jq --arg h "$name" --arg a "$addr" --argjson pmin "$pmin" --argjson pmax "$pmax" \
-      '.hosts[$h] = {address:$a, port_min:$pmin, port_max:$pmax}' \
-      "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
-    info "added host ${name} (${addr})"
+    info "host ${name} (${addr})"
   fi
 }
 
-# --- Catalog ---
+# ============================================================
+# lib/profiles.sh
+# ============================================================
 
-ensure_catalog() {
-  [[ -f "$CATALOG" ]] || die "no catalog — run: mcpx init"
-}
-
-catalog_names() {
-  jq -r '.mcpServers | keys[]' "$CATALOG" | sort
-}
-
-# Fuzzy match against a name list
-_fuzzy() {
-  local q="$1"
-  local names="$2"
-
-  # Exact
-  if echo "$names" | grep -qx "$q"; then
-    echo "$q"; return
-  fi
-
-  # Prefix
-  local matches
-  matches=$(echo "$names" | grep "^${q}" || true)
-  if [[ -n "$matches" ]]; then
-    local count
-    count=$(echo "$matches" | wc -l | tr -d ' ')
-    if [[ "$count" -eq 1 ]]; then
-      echo "$matches"; return
-    fi
-  fi
-
-  # Contains
-  matches=$(echo "$names" | grep "${q}" || true)
-  if [[ -n "$matches" ]]; then
-    local count
-    count=$(echo "$matches" | wc -l | tr -d ' ')
-    if [[ "$count" -eq 1 ]]; then
-      echo "$matches"; return
-    fi
-    echo -e "${Y}ambiguous:${N} '${q}' matches:" >&2
-    echo "$matches" | sed 's/^/  /' >&2
-    return 1
-  fi
-
-  echo -e "${R}no match:${N} '${q}'" >&2
-  return 1
-}
-
-fuzzy_match() {
-  _fuzzy "$1" "$(catalog_names)"
-}
-
-fuzzy_match_current() {
-  [[ -f "$TARGET" ]] || die "no $TARGET in current directory"
-  local names
-  names=$(jq -r '.mcpServers | keys[]' "$TARGET" 2>/dev/null | sort)
-  [[ -n "$names" ]] || die "$TARGET is empty"
-  _fuzzy "$1" "$names"
-}
-
-# --- Profiles ---
-
-PROFILES="${CONFIG_DIR}/profiles.json"
-
-ensure_profiles() {
-  ensure_config_dir
-  [[ -f "$PROFILES" ]] || echo '{}' > "$PROFILES"
-}
 
 is_profile() {
   [[ -f "$PROFILES" ]] && jq -e --arg p "$1" '.[$p]' "$PROFILES" &>/dev/null
@@ -358,8 +362,7 @@ cmd_profile_save() {
 
   local json_arr
   json_arr=$(printf '%s\n' "${mcps[@]}" | jq -R . | jq -s .)
-  jq --arg n "$name" --argjson v "$json_arr" '.[$n] = $v' "$PROFILES" > "${PROFILES}.tmp" \
-    && mv "${PROFILES}.tmp" "$PROFILES"
+  json_update "$PROFILES" --arg n "$name" --argjson v "$json_arr" '.[$n] = $v'
   info "profile ${C}${name}${N} (${#mcps[@]} MCPs)"
   printf '  %s\n' "${mcps[@]}"
 }
@@ -374,7 +377,7 @@ cmd_profile_ls() {
   fi
   echo -e "${B}profiles${N}"
   echo "$profiles" | while read -r name; do
-    local members count
+    local count members
     count=$(jq --arg n "$name" '.[$n] | length' "$PROFILES")
     members=$(jq -r --arg n "$name" '.[$n] | join(", ")' "$PROFILES")
     echo -e "  ${C}${name}${N} ${D}(${count})${N} ${D}${members}${N}"
@@ -387,12 +390,14 @@ cmd_profile_rm() {
   if ! jq -e --arg n "$name" '.[$n]' "$PROFILES" &>/dev/null; then
     die "profile '$name' not found"
   fi
-  jq --arg n "$name" 'del(.[$n])' "$PROFILES" > "${PROFILES}.tmp" \
-    && mv "${PROFILES}.tmp" "$PROFILES"
+  json_update "$PROFILES" --arg n "$name" 'del(.[$n])'
   echo -e "${R}-${N} profile ${name}"
 }
 
-# --- Commands ---
+# ============================================================
+# lib/catalog.sh
+# ============================================================
+
 
 cmd_show() {
   if [[ ! -f "$TARGET" ]]; then
@@ -409,9 +414,8 @@ cmd_show() {
   count=$(echo "$keys" | wc -l | tr -d ' ')
   echo -e "${B}${TARGET}${N} ${D}(${count})${N}"
   echo "$keys" | while read -r k; do
-    local url
+    local url port
     url=$(jq -r ".mcpServers[\"$k\"].url" "$TARGET")
-    local port
     port=$(echo "$url" | grep -oE ':[0-9]+/' | tr -d ':/')
     echo -e "  ${C}${k}${N} ${D}:${port}${N}"
   done
@@ -454,8 +458,7 @@ cmd_add_single() {
 
   local entry
   entry=$(jq ".mcpServers[\"$resolved\"]" "$CATALOG")
-  jq --arg k "$resolved" --argjson v "$entry" \
-    '.mcpServers[$k] = $v' "$TARGET" > "${TARGET}.tmp" && mv "${TARGET}.tmp" "$TARGET"
+  json_update "$TARGET" --arg k "$resolved" --argjson v "$entry" '.mcpServers[$k] = $v'
   info "${resolved}"
 }
 
@@ -466,18 +469,16 @@ cmd_rm_single() {
   local resolved
   resolved=$(fuzzy_match_current "$name") || return 1
 
-  jq --arg k "$resolved" 'del(.mcpServers[$k])' "$TARGET" > "${TARGET}.tmp" && mv "${TARGET}.tmp" "$TARGET"
+  json_update "$TARGET" --arg k "$resolved" 'del(.mcpServers[$k])'
   echo -e "${R}-${N} ${resolved}"
 }
 
-# Add: check profile first, then catalog
+# Add: profile-aware (checks profiles first, then catalog)
 cmd_add() {
   local name="$1"
   if is_profile "$name"; then
     dim "profile: ${name}"
-    local members
-    members=$(jq -r --arg n "$name" '.[$n][]' "$PROFILES")
-    echo "$members" | while read -r m; do
+    jq -r --arg n "$name" '.[$n][]' "$PROFILES" | while read -r m; do
       cmd_add_single "$m"
     done
   else
@@ -485,14 +486,12 @@ cmd_add() {
   fi
 }
 
-# Remove: check profile first, then current config
+# Remove: profile-aware
 cmd_rm() {
   local name="$1"
   if is_profile "$name"; then
     dim "profile: ${name}"
-    local members
-    members=$(jq -r --arg n "$name" '.[$n][]' "$PROFILES")
-    echo "$members" | while read -r m; do
+    jq -r --arg n "$name" '.[$n][]' "$PROFILES" | while read -r m; do
       cmd_rm_single "$m" 2>/dev/null || true
     done
   else
@@ -511,7 +510,6 @@ cmd_catalog_mod() {
   local name="$1"
   local port="${2:-}"
 
-  # Need a host to build the URL
   load_host
 
   if [[ -z "$port" ]]; then
@@ -519,10 +517,10 @@ cmd_catalog_mod() {
       echo -e "${R}not in catalog:${N} $name" >&2
       return 1
     fi
-    jq --arg k "$name" 'del(.mcpServers[$k])' "$CATALOG" > "${CATALOG}.tmp" \
-      && mv "${CATALOG}.tmp" "$CATALOG"
+    json_update "$CATALOG" --arg k "$name" 'del(.mcpServers[$k])'
     echo -e "${R}-${N} ${name} ${D}(removed from catalog)${N}"
   else
+    local url="http://${MCP_HOST}:${port}/mcp"
     if jq -e ".mcpServers[\"$name\"]" "$CATALOG" &>/dev/null; then
       local old_port
       old_port=$(jq -r ".mcpServers[\"$name\"].url" "$CATALOG" | grep -oE ':[0-9]+/' | tr -d ':/')
@@ -530,20 +528,19 @@ cmd_catalog_mod() {
         warn "${name} already in catalog at :${port}"
         return 0
       fi
-      local url="http://${MCP_HOST}:${port}/mcp"
-      jq --arg k "$name" --arg u "$url" \
-        '.mcpServers[$k].url = $u' "$CATALOG" > "${CATALOG}.tmp" \
-        && mv "${CATALOG}.tmp" "$CATALOG"
+      json_update "$CATALOG" --arg k "$name" --arg u "$url" '.mcpServers[$k].url = $u'
       echo -e "${Y}~${N} ${name} ${D}:${old_port} → :${port}${N}"
     else
-      local url="http://${MCP_HOST}:${port}/mcp"
-      jq --arg k "$name" --arg u "$url" \
-        '.mcpServers[$k] = {"type":"http","url":$u}' "$CATALOG" > "${CATALOG}.tmp" \
-        && mv "${CATALOG}.tmp" "$CATALOG"
+      json_update "$CATALOG" --arg k "$name" --arg u "$url" '.mcpServers[$k] = {"type":"http","url":$u}'
       info "${name} ${D}:${port} → catalog${N}"
     fi
   fi
 }
+
+# ============================================================
+# lib/scan.sh
+# ============================================================
+
 
 cmd_scan() {
   local host_name="${1:-}"
@@ -583,7 +580,7 @@ cmd_scan() {
     fi
   done
 
-  # Phase 2: parallel MCP probe on live ports (get server info + tool count)
+  # Phase 2: parallel MCP protocol probe on live ports
   local probe_dir
   probe_dir=$(mktemp -d)
   local init_body='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"mcpx","version":"'"${VERSION}"'"}}}'
@@ -595,7 +592,7 @@ cmd_scan() {
       local headers="Content-Type: application/json"
       local accept="Accept: application/json, text/event-stream"
 
-      # Initialize → get server name + version
+      # Initialize → server name + version
       local init_resp
       init_resp=$(curl -s -X POST "$url" -H "$headers" -H "$accept" \
         --max-time 2 -d "$init_body" 2>/dev/null | grep "^data:" | head -1 | sed 's/^data: //')
@@ -604,7 +601,7 @@ cmd_scan() {
       srv_name=$(echo "$init_resp" | jq -r '.result.serverInfo.name // empty' 2>/dev/null)
       srv_ver=$(echo "$init_resp" | jq -r '.result.serverInfo.version // empty' 2>/dev/null)
 
-      # tools/list → get tool count and names
+      # tools/list → tool count and names
       local tools_resp
       tools_resp=$(curl -s -X POST "$url" -H "$headers" -H "$accept" \
         --max-time 2 -d "$tools_body" 2>/dev/null | grep "^data:" | head -1 | sed 's/^data: //')
@@ -652,9 +649,9 @@ cmd_scan() {
   fi
 }
 
-cmd_version() {
-  echo "mcpx ${VERSION}"
-}
+# ============================================================
+# main — command routing
+# ============================================================
 
 cmd_help() {
   cat <<'HELP'
@@ -703,13 +700,17 @@ Environment:
 HELP
 }
 
-# --- Main ---
+cmd_version() {
+  echo "mcpx ${VERSION}"
+}
 
+# No args: show current config
 if [[ $# -eq 0 ]]; then
   cmd_show
   exit 0
 fi
 
+# Named commands
 case "$1" in
   -v|--version|version)  cmd_version; exit 0 ;;
   -h|--help|help)        cmd_help; exit 0 ;;
@@ -734,7 +735,7 @@ case "$1" in
     ;;
 esac
 
-# : commands: profile management
+# : commands — profile management
 if [[ "$1" == :* ]]; then
   subcmd="${1:1}"
   shift
@@ -746,7 +747,7 @@ if [[ "$1" == :* ]]; then
   esac
 fi
 
-# @ commands: catalog management
+# @ commands — catalog management
 if [[ "$1" == @* ]]; then
   name="${1:1}"
   [[ -n "$name" ]] || die "usage: mcpx @name [port]"
@@ -754,7 +755,7 @@ if [[ "$1" == @* ]]; then
   exit $?
 fi
 
-# Process +/- operations
+# +/- operations
 errors=0
 for arg in "$@"; do
   case "$arg" in
