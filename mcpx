@@ -1,0 +1,462 @@
+#!/usr/bin/env bash
+# mcpx — fast MCP config manager for .mcp.json
+# https://github.com/nunoquispe/mcpx
+#
+# Usage:
+#   mcpx                     show current .mcp.json
+#   mcpx ls                  list catalog (marks active with *)
+#   mcpx +pg +ssh-d          add MCPs (fuzzy match)
+#   mcpx -pg                 remove MCP (fuzzy match)
+#   mcpx +pg -hana           mix add/remove in one shot
+#   mcpx 0                   truncate .mcp.json to empty
+#   mcpx @name 3240          add/update entry in catalog
+#   mcpx @name               remove entry from catalog
+#   mcpx scan [host]         scan host ports for live MCPs
+#   mcpx init                initialize config
+#   mcpx hosts               list configured hosts
+
+set -euo pipefail
+
+VERSION="0.1.0"
+CONFIG_DIR="${MCPX_CONFIG_DIR:-$HOME/.config/mcpx}"
+CONFIG_FILE="${CONFIG_DIR}/config.json"
+CATALOG="${CONFIG_DIR}/catalog.json"
+TARGET=".mcp.json"
+
+# Colors
+R='\033[0;31m'  G='\033[0;32m'  Y='\033[0;33m'
+C='\033[0;36m'  B='\033[1m'     D='\033[0;90m'
+N='\033[0m'
+
+die()  { echo -e "${R}error:${N} $1" >&2; exit 1; }
+info() { echo -e "${G}+${N} $1"; }
+warn() { echo -e "${Y}~${N} $1"; }
+dim()  { echo -e "${D}$1${N}"; }
+
+# --- Config ---
+
+ensure_config_dir() {
+  [[ -d "$CONFIG_DIR" ]] || mkdir -p "$CONFIG_DIR"
+}
+
+load_host() {
+  local host_name="${1:-}"
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    die "not initialized — run: mcpx init"
+  fi
+  if [[ -z "$host_name" ]]; then
+    host_name=$(jq -r '.default_host // empty' "$CONFIG_FILE")
+    [[ -n "$host_name" ]] || die "no default_host in config"
+  fi
+  MCP_HOST=$(jq -r --arg h "$host_name" '.hosts[$h].address // empty' "$CONFIG_FILE")
+  [[ -n "$MCP_HOST" ]] || die "host '$host_name' not found in config"
+  PORT_MIN=$(jq -r --arg h "$host_name" '.hosts[$h].port_min // 3200' "$CONFIG_FILE")
+  PORT_MAX=$(jq -r --arg h "$host_name" '.hosts[$h].port_max // 3250' "$CONFIG_FILE")
+  CURRENT_HOST="$host_name"
+}
+
+cmd_init() {
+  ensure_config_dir
+
+  if [[ -f "$CONFIG_FILE" ]]; then
+    warn "config already exists: $CONFIG_FILE"
+    read -rp "Overwrite? [y/N] " ans
+    [[ "$ans" =~ ^[yY]$ ]] || exit 0
+  fi
+
+  echo -e "${B}mcpx init${N}"
+  echo ""
+
+  read -rp "Host name (e.g. mini, server, local): " host_name
+  [[ -n "$host_name" ]] || die "host name required"
+
+  read -rp "Host address (IP or hostname): " host_addr
+  [[ -n "$host_addr" ]] || die "address required"
+
+  read -rp "Port range start [3200]: " port_min
+  port_min="${port_min:-3200}"
+
+  read -rp "Port range end [3250]: " port_max
+  port_max="${port_max:-3250}"
+
+  cat > "$CONFIG_FILE" <<EOF
+{
+  "default_host": "${host_name}",
+  "hosts": {
+    "${host_name}": {
+      "address": "${host_addr}",
+      "port_min": ${port_min},
+      "port_max": ${port_max}
+    }
+  }
+}
+EOF
+
+  # Create empty catalog if none exists
+  if [[ ! -f "$CATALOG" ]]; then
+    echo '{"mcpServers":{}}' > "$CATALOG"
+    info "created empty catalog"
+  fi
+
+  info "config saved to $CONFIG_FILE"
+  echo ""
+  dim "next: mcpx scan — discover live MCPs"
+  dim "  or: mcpx @my-server 3201 — add to catalog manually"
+}
+
+cmd_hosts() {
+  [[ -f "$CONFIG_FILE" ]] || die "not initialized — run: mcpx init"
+  local default_host
+  default_host=$(jq -r '.default_host // ""' "$CONFIG_FILE")
+  echo -e "${B}hosts${N}"
+  jq -r '.hosts | to_entries[] | "\(.key) \(.value.address) \(.value.port_min) \(.value.port_max)"' "$CONFIG_FILE" \
+    | while read -r name addr pmin pmax; do
+      if [[ "$name" == "$default_host" ]]; then
+        echo -e "  ${G}*${N} ${C}${name}${N} ${D}${addr} :${pmin}-${pmax}${N}"
+      else
+        echo -e "    ${name} ${D}${addr} :${pmin}-${pmax}${N}"
+      fi
+    done
+}
+
+cmd_host_add() {
+  [[ -f "$CONFIG_FILE" ]] || die "not initialized — run: mcpx init"
+  local name="$1" addr="$2" pmin="${3:-3200}" pmax="${4:-3250}"
+
+  if jq -e --arg h "$name" '.hosts[$h]' "$CONFIG_FILE" &>/dev/null; then
+    # Update existing
+    jq --arg h "$name" --arg a "$addr" --argjson pmin "$pmin" --argjson pmax "$pmax" \
+      '.hosts[$h] = {address:$a, port_min:$pmin, port_max:$pmax}' \
+      "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+    warn "updated host ${name}"
+  else
+    jq --arg h "$name" --arg a "$addr" --argjson pmin "$pmin" --argjson pmax "$pmax" \
+      '.hosts[$h] = {address:$a, port_min:$pmin, port_max:$pmax}' \
+      "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+    info "added host ${name} (${addr})"
+  fi
+}
+
+# --- Catalog ---
+
+ensure_catalog() {
+  [[ -f "$CATALOG" ]] || die "no catalog — run: mcpx init"
+}
+
+catalog_names() {
+  jq -r '.mcpServers | keys[]' "$CATALOG" | sort
+}
+
+# Fuzzy match against a name list
+_fuzzy() {
+  local q="$1"
+  local names="$2"
+
+  # Exact
+  if echo "$names" | grep -qx "$q"; then
+    echo "$q"; return
+  fi
+
+  # Prefix
+  local matches
+  matches=$(echo "$names" | grep "^${q}" || true)
+  if [[ -n "$matches" ]]; then
+    local count
+    count=$(echo "$matches" | wc -l | tr -d ' ')
+    if [[ "$count" -eq 1 ]]; then
+      echo "$matches"; return
+    fi
+  fi
+
+  # Contains
+  matches=$(echo "$names" | grep "${q}" || true)
+  if [[ -n "$matches" ]]; then
+    local count
+    count=$(echo "$matches" | wc -l | tr -d ' ')
+    if [[ "$count" -eq 1 ]]; then
+      echo "$matches"; return
+    fi
+    echo -e "${Y}ambiguous:${N} '${q}' matches:" >&2
+    echo "$matches" | sed 's/^/  /' >&2
+    return 1
+  fi
+
+  echo -e "${R}no match:${N} '${q}'" >&2
+  return 1
+}
+
+fuzzy_match() {
+  _fuzzy "$1" "$(catalog_names)"
+}
+
+fuzzy_match_current() {
+  [[ -f "$TARGET" ]] || die "no $TARGET in current directory"
+  local names
+  names=$(jq -r '.mcpServers | keys[]' "$TARGET" 2>/dev/null | sort)
+  [[ -n "$names" ]] || die "$TARGET is empty"
+  _fuzzy "$1" "$names"
+}
+
+# --- Commands ---
+
+cmd_show() {
+  if [[ ! -f "$TARGET" ]]; then
+    dim "no $TARGET in $(pwd)"
+    return
+  fi
+  local keys
+  keys=$(jq -r '.mcpServers | keys[]' "$TARGET" 2>/dev/null)
+  if [[ -z "$keys" ]]; then
+    dim "(empty)"
+    return
+  fi
+  local count
+  count=$(echo "$keys" | wc -l | tr -d ' ')
+  echo -e "${B}${TARGET}${N} ${D}(${count})${N}"
+  echo "$keys" | while read -r k; do
+    local url
+    url=$(jq -r ".mcpServers[\"$k\"].url" "$TARGET")
+    local port
+    port=$(echo "$url" | grep -oE ':[0-9]+/' | tr -d ':/')
+    echo -e "  ${C}${k}${N} ${D}:${port}${N}"
+  done
+}
+
+cmd_list() {
+  ensure_catalog
+  local active=""
+  if [[ -f "$TARGET" ]]; then
+    active=$(jq -r '.mcpServers | keys[]' "$TARGET" 2>/dev/null || true)
+  fi
+  local total
+  total=$(jq '.mcpServers | length' "$CATALOG")
+  echo -e "${B}catalog${N} ${D}(${total})${N}"
+  catalog_names | while read -r name; do
+    local port
+    port=$(jq -r ".mcpServers[\"$name\"].url" "$CATALOG" | grep -oE ':[0-9]+/' | tr -d ':/')
+    if echo "$active" | grep -qx "$name"; then
+      echo -e "  ${G}*${N} ${C}${name}${N} ${D}:${port}${N}"
+    else
+      echo -e "    ${name} ${D}:${port}${N}"
+    fi
+  done
+}
+
+cmd_add() {
+  ensure_catalog
+  local name="$1"
+  local resolved
+  resolved=$(fuzzy_match "$name") || return 1
+
+  if [[ ! -f "$TARGET" ]]; then
+    echo '{"mcpServers":{}}' > "$TARGET"
+  fi
+
+  if jq -e ".mcpServers[\"$resolved\"]" "$TARGET" &>/dev/null; then
+    warn "${resolved} already in config"
+    return 0
+  fi
+
+  local entry
+  entry=$(jq ".mcpServers[\"$resolved\"]" "$CATALOG")
+  jq --arg k "$resolved" --argjson v "$entry" \
+    '.mcpServers[$k] = $v' "$TARGET" > "${TARGET}.tmp" && mv "${TARGET}.tmp" "$TARGET"
+  info "${resolved}"
+}
+
+cmd_rm() {
+  local name="$1"
+  [[ -f "$TARGET" ]] || die "no $TARGET in current directory"
+
+  local resolved
+  resolved=$(fuzzy_match_current "$name") || return 1
+
+  jq --arg k "$resolved" 'del(.mcpServers[$k])' "$TARGET" > "${TARGET}.tmp" && mv "${TARGET}.tmp" "$TARGET"
+  echo -e "${R}-${N} ${resolved}"
+}
+
+cmd_clean() {
+  echo '{"mcpServers":{}}' > "$TARGET"
+  info "cleaned $TARGET"
+}
+
+cmd_catalog_mod() {
+  ensure_catalog
+  local name="$1"
+  local port="${2:-}"
+
+  # Need a host to build the URL
+  load_host
+
+  if [[ -z "$port" ]]; then
+    if ! jq -e ".mcpServers[\"$name\"]" "$CATALOG" &>/dev/null; then
+      echo -e "${R}not in catalog:${N} $name" >&2
+      return 1
+    fi
+    jq --arg k "$name" 'del(.mcpServers[$k])' "$CATALOG" > "${CATALOG}.tmp" \
+      && mv "${CATALOG}.tmp" "$CATALOG"
+    echo -e "${R}-${N} ${name} ${D}(removed from catalog)${N}"
+  else
+    if jq -e ".mcpServers[\"$name\"]" "$CATALOG" &>/dev/null; then
+      local old_port
+      old_port=$(jq -r ".mcpServers[\"$name\"].url" "$CATALOG" | grep -oE ':[0-9]+/' | tr -d ':/')
+      if [[ "$old_port" == "$port" ]]; then
+        warn "${name} already in catalog at :${port}"
+        return 0
+      fi
+      local url="http://${MCP_HOST}:${port}/mcp"
+      jq --arg k "$name" --arg u "$url" \
+        '.mcpServers[$k].url = $u' "$CATALOG" > "${CATALOG}.tmp" \
+        && mv "${CATALOG}.tmp" "$CATALOG"
+      echo -e "${Y}~${N} ${name} ${D}:${old_port} → :${port}${N}"
+    else
+      local url="http://${MCP_HOST}:${port}/mcp"
+      jq --arg k "$name" --arg u "$url" \
+        '.mcpServers[$k] = {"type":"http","url":$u}' "$CATALOG" > "${CATALOG}.tmp" \
+        && mv "${CATALOG}.tmp" "$CATALOG"
+      info "${name} ${D}:${port} → catalog${N}"
+    fi
+  fi
+}
+
+cmd_scan() {
+  local host_name="${1:-}"
+  load_host "$host_name"
+
+  echo -e "${B}scanning${N} ${C}${CURRENT_HOST}${N} ${D}${MCP_HOST}:${PORT_MIN}-${PORT_MAX}${N}"
+  echo ""
+
+  ensure_catalog
+
+  # Build port→name map
+  local port_map_file
+  port_map_file=$(mktemp)
+  jq -r '.mcpServers | to_entries[] | "\(.value.url | capture("(?<p>[0-9]{4})") | .p)=\(.key)"' \
+    "$CATALOG" > "$port_map_file"
+
+  # Parallel curl scan
+  local tmpdir
+  tmpdir=$(mktemp -d)
+  for port in $(seq "$PORT_MIN" "$PORT_MAX"); do
+    (
+      local code
+      code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 1 \
+        "http://${MCP_HOST}:${port}/mcp" 2>/dev/null || echo "000")
+      if [[ "$code" != "000" ]]; then
+        echo "$port" > "${tmpdir}/${port}"
+      fi
+    ) &
+  done
+  wait
+
+  local found=0
+  local new=0
+  for port in $(seq "$PORT_MIN" "$PORT_MAX"); do
+    if [[ -f "${tmpdir}/${port}" ]]; then
+      local known_name=""
+      known_name=$(grep "^${port}=" "$port_map_file" | cut -d= -f2 || true)
+      if [[ -n "$known_name" ]]; then
+        echo -e "  ${G}*${N} :${port} ${C}${known_name}${N}"
+      else
+        echo -e "  ${Y}?${N} :${port} ${Y}(not in catalog)${N}"
+        new=$((new + 1))
+      fi
+      found=$((found + 1))
+    fi
+  done
+  rm -rf "$tmpdir" "$port_map_file"
+
+  echo ""
+  echo -e "${D}${found} live, ${new} unknown${N}"
+  if [[ $new -gt 0 ]]; then
+    dim "use: mcpx @name port — to register"
+  fi
+}
+
+cmd_version() {
+  echo "mcpx ${VERSION}"
+}
+
+cmd_help() {
+  cat <<'HELP'
+mcpx — fast MCP config manager
+
+Usage:
+  mcpx                     show current .mcp.json
+  mcpx ls                  list catalog (* = active in .mcp.json)
+  mcpx +name               add MCP to .mcp.json (fuzzy match)
+  mcpx -name               remove MCP from .mcp.json (fuzzy match)
+  mcpx +a +b -c            mix add/remove in one shot
+  mcpx 0                   truncate .mcp.json
+
+Catalog:
+  mcpx @name port          add/update MCP in catalog
+  mcpx @name               remove MCP from catalog
+
+Discovery:
+  mcpx scan [host]         scan host ports for live MCPs
+  mcpx hosts               list configured hosts
+
+Setup:
+  mcpx init                initialize config (~/.config/mcpx/)
+  mcpx -v, --version       show version
+  mcpx -h, --help          show this help
+
+Fuzzy matching:
+  "pg"    → pg-enterprise
+  "ssh-d" → ssh-dev
+  "duck"  → duckdb-files-enterprise
+
+Environment:
+  MCPX_CONFIG_DIR          override config dir (default: ~/.config/mcpx)
+HELP
+}
+
+# --- Main ---
+
+if [[ $# -eq 0 ]]; then
+  cmd_show
+  exit 0
+fi
+
+case "$1" in
+  -v|--version|version)  cmd_version; exit 0 ;;
+  -h|--help|help)        cmd_help; exit 0 ;;
+  init)                  cmd_init; exit 0 ;;
+  hosts)                 cmd_hosts; exit 0 ;;
+  "?"|ls|list)           cmd_list; exit 0 ;;
+  0|clean)               cmd_clean; exit 0 ;;
+  scan)                  cmd_scan "${2:-}"; exit 0 ;;
+  host)
+    shift
+    case "${1:-}" in
+      add)  cmd_host_add "$2" "$3" "${4:-3200}" "${5:-3250}"; exit 0 ;;
+      *)    cmd_hosts; exit 0 ;;
+    esac
+    ;;
+esac
+
+# @ commands: catalog management
+if [[ "$1" == @* ]]; then
+  name="${1:1}"
+  [[ -n "$name" ]] || die "usage: mcpx @name [port]"
+  cmd_catalog_mod "$name" "${2:-}"
+  exit $?
+fi
+
+# Process +/- operations
+errors=0
+for arg in "$@"; do
+  case "$arg" in
+    +*)  cmd_add "${arg:1}" || errors=$((errors + 1)) ;;
+    -*)  cmd_rm "${arg:1}" || errors=$((errors + 1)) ;;
+    *)   warn "unknown: $arg (try: mcpx --help)"; errors=$((errors + 1)) ;;
+  esac
+done
+
+if [[ $errors -lt $# ]]; then
+  echo ""
+  cmd_show
+fi
+
+exit $errors
