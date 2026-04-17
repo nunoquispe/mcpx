@@ -60,10 +60,10 @@ remove_managed_block() {
 
 # Generate TOML block from current .mcp.json
 generate_codex_toml() {
-  [[ -f "$TARGET" ]] || return
+  [[ -f "$TARGET" ]] || return 0
   local count
   count=$(jq '.mcpServers | length' "$TARGET")
-  [[ "$count" -gt 0 ]] || return
+  [[ "$count" -gt 0 ]] || return 0
 
   echo ""
   echo "$BEGIN_MARKER"
@@ -90,12 +90,11 @@ sync_codex() {
   # Remove old managed block
   remove_managed_block "$codex_config" "$stripped"
 
-  # Remove trailing blank lines from stripped
-  sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$stripped" > "$tmp"
+  # Build new config: stripped content + managed block
+  cp "$stripped" "$tmp"
 
-  # Append new block
+  # Append new block if there are MCPs
   generate_codex_toml >> "$tmp"
-  echo "" >> "$tmp"
 
   mv "$tmp" "$codex_config"
   rm -f "$stripped"
@@ -330,6 +329,69 @@ fuzzy_match_current() {
   _fuzzy "$1" "$names"
 }
 
+# --- Profiles ---
+
+PROFILES="${CONFIG_DIR}/profiles.json"
+
+ensure_profiles() {
+  ensure_config_dir
+  [[ -f "$PROFILES" ]] || echo '{}' > "$PROFILES"
+}
+
+is_profile() {
+  [[ -f "$PROFILES" ]] && jq -e --arg p "$1" '.[$p]' "$PROFILES" &>/dev/null
+}
+
+cmd_profile_save() {
+  ensure_profiles
+  ensure_catalog
+  local name="$1"; shift
+  [[ -n "$name" ]] || die "usage: mcpx :save <name> <mcp1> <mcp2> ..."
+  [[ $# -gt 0 ]] || die "provide at least one MCP name"
+
+  local mcps=()
+  for m in "$@"; do
+    local resolved
+    resolved=$(fuzzy_match "$m") || return 1
+    mcps+=("$resolved")
+  done
+
+  local json_arr
+  json_arr=$(printf '%s\n' "${mcps[@]}" | jq -R . | jq -s .)
+  jq --arg n "$name" --argjson v "$json_arr" '.[$n] = $v' "$PROFILES" > "${PROFILES}.tmp" \
+    && mv "${PROFILES}.tmp" "$PROFILES"
+  info "profile ${C}${name}${N} (${#mcps[@]} MCPs)"
+  printf '  %s\n' "${mcps[@]}"
+}
+
+cmd_profile_ls() {
+  ensure_profiles
+  local profiles
+  profiles=$(jq -r 'keys[]' "$PROFILES" 2>/dev/null)
+  if [[ -z "$profiles" ]]; then
+    dim "(no profiles)"
+    return
+  fi
+  echo -e "${B}profiles${N}"
+  echo "$profiles" | while read -r name; do
+    local members count
+    count=$(jq --arg n "$name" '.[$n] | length' "$PROFILES")
+    members=$(jq -r --arg n "$name" '.[$n] | join(", ")' "$PROFILES")
+    echo -e "  ${C}${name}${N} ${D}(${count})${N} ${D}${members}${N}"
+  done
+}
+
+cmd_profile_rm() {
+  ensure_profiles
+  local name="$1"
+  if ! jq -e --arg n "$name" '.[$n]' "$PROFILES" &>/dev/null; then
+    die "profile '$name' not found"
+  fi
+  jq --arg n "$name" 'del(.[$n])' "$PROFILES" > "${PROFILES}.tmp" \
+    && mv "${PROFILES}.tmp" "$PROFILES"
+  echo -e "${R}-${N} profile ${name}"
+}
+
 # --- Commands ---
 
 cmd_show() {
@@ -375,7 +437,7 @@ cmd_list() {
   done
 }
 
-cmd_add() {
+cmd_add_single() {
   ensure_catalog
   local name="$1"
   local resolved
@@ -397,7 +459,7 @@ cmd_add() {
   info "${resolved}"
 }
 
-cmd_rm() {
+cmd_rm_single() {
   local name="$1"
   [[ -f "$TARGET" ]] || die "no $TARGET in current directory"
 
@@ -406,6 +468,36 @@ cmd_rm() {
 
   jq --arg k "$resolved" 'del(.mcpServers[$k])' "$TARGET" > "${TARGET}.tmp" && mv "${TARGET}.tmp" "$TARGET"
   echo -e "${R}-${N} ${resolved}"
+}
+
+# Add: check profile first, then catalog
+cmd_add() {
+  local name="$1"
+  if is_profile "$name"; then
+    dim "profile: ${name}"
+    local members
+    members=$(jq -r --arg n "$name" '.[$n][]' "$PROFILES")
+    echo "$members" | while read -r m; do
+      cmd_add_single "$m"
+    done
+  else
+    cmd_add_single "$name"
+  fi
+}
+
+# Remove: check profile first, then current config
+cmd_rm() {
+  local name="$1"
+  if is_profile "$name"; then
+    dim "profile: ${name}"
+    local members
+    members=$(jq -r --arg n "$name" '.[$n][]' "$PROFILES")
+    echo "$members" | while read -r m; do
+      cmd_rm_single "$m" 2>/dev/null || true
+    done
+  else
+    cmd_rm_single "$name"
+  fi
 }
 
 cmd_clean() {
@@ -576,6 +668,13 @@ Usage:
   mcpx +a +b -c            mix add/remove in one shot
   mcpx 0                   truncate .mcp.json
 
+Profiles:
+  mcpx :save dev pg ssh-d  save profile "dev" with MCPs
+  mcpx :ls                 list profiles
+  mcpx :rm dev             delete profile
+  mcpx +dev                add all MCPs in profile (auto-detected)
+  mcpx -dev                remove all MCPs in profile
+
 Catalog:
   mcpx @name port          add/update MCP in catalog
   mcpx @name               remove MCP from catalog
@@ -634,6 +733,18 @@ case "$1" in
     esac
     ;;
 esac
+
+# : commands: profile management
+if [[ "$1" == :* ]]; then
+  subcmd="${1:1}"
+  shift
+  case "$subcmd" in
+    save|s)  cmd_profile_save "$@"; exit $? ;;
+    ls|list) cmd_profile_ls; exit 0 ;;
+    rm)      cmd_profile_rm "$1"; exit $? ;;
+    *)       die "unknown: :$subcmd (use :save, :ls, :rm)" ;;
+  esac
+fi
 
 # @ commands: catalog management
 if [[ "$1" == @* ]]; then
