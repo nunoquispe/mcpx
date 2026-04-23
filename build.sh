@@ -187,7 +187,7 @@ fi
 if [[ "$1" == @* ]]; then
   name="${1:1}"
   [[ -n "$name" ]] || die "usage: mcpx @name [port]"
-  cmd_catalog_mod "$name" "${2:-}"
+  cmd_catalog "$name" "${2:-}"
   exit $?
 fi
 

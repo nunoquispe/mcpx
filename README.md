@@ -233,13 +233,14 @@ mcpx/
 ├── mcpx             # distributable script (built from lib/)
 ├── build.sh         # assembles lib/*.sh → mcpx
 ├── lib/
-│   ├── core.sh      # constants, colors, helpers
-│   ├── fuzzy.sh     # fuzzy name matching
-│   ├── sync.sh      # auto-sync to external clients
-│   ├── config.sh    # init, hosts, load_host
-│   ├── profiles.sh  # profile management
-│   ├── catalog.sh   # show, list, add, remove, catalog mod
-│   └── scan.sh      # port scanning and MCP discovery
+│   ├── core.sh      # constants, colors, shared helpers (paths, json, url, tempdir)
+│   ├── fuzzy.sh     # fuzzy name matching (literal-string safe)
+│   ├── overrides.sh # temporary URL remapping (override-first resolution)
+│   ├── sync.sh      # auto-sync to external clients (Codex today)
+│   ├── config.sh    # init, hosts, load_host → HOST_* globals
+│   ├── profiles.sh  # named groups of MCPs
+│   ├── catalog.sh   # show/list/add/remove/refresh/catalog edit
+│   └── scan.sh      # parallel port scan + MCP handshake
 ├── install.sh       # curl installer
 ├── README.md
 └── LICENSE
