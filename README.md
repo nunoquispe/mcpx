@@ -119,6 +119,47 @@ mcpx host add staging 10.0.0.5        # add host (default port range 3200-3250)
 mcpx host add prod 10.0.0.6 8000 8050 # custom port range
 ```
 
+### Overrides (contingency URL remapping)
+
+When your MCP host goes down and you spin up a local fallback on different
+ports, overrides redirect catalog entries to alternate URLs **without
+touching the catalog**. Resolution happens at `+add` time and at `refresh`
+time — catalog stays pristine and reverting is one command.
+
+```bash
+# One-shot: scan a local fallback host, auto-match by server name, apply
+mcpx host add local 127.0.0.1 3100 3150
+mcpx override from local --dry-run   # preview
+mcpx override from local             # prompts before applying
+mcpx override from local --yes       # skip prompt
+
+# Rewrite existing .mcp.json files to pick up overrides
+mcpx refresh                          # CWD only
+mcpx refresh --walk ~/Dev --dry-run   # preview across tree
+mcpx refresh --walk ~/Dev             # apply (backup in $MCPX_CONFIG_DIR)
+
+# Manual control
+mcpx override ls
+mcpx override set pg http://127.0.0.1:3101/mcp
+mcpx override rm pg
+
+# When the original host is back
+mcpx override clear
+mcpx refresh --walk ~/Dev             # reverts URLs to catalog
+```
+
+`mcpx ls` marks overridden entries with `!→`, and `mcpx +name` writes the
+effective URL (override-first, catalog-fallback). Entries with active
+overrides appear as `name :port !` in `mcpx` (CWD show).
+
+`override from <host>` fuzzy-matches each live MCP's `serverInfo.name`
+against catalog names (token-by-token, longest-token-first). Unmatched
+entries are listed so you can register them manually with `@name port`.
+
+`refresh` only touches entries whose name exists in the catalog —
+manually-added entries in your `.mcp.json` are left alone. `--walk` skips
+`+archives/`, `node_modules/`, `.git/`, and prior backup directories.
+
 ### Sync
 
 Auto-sync your `.mcp.json` to other AI coding tools:
@@ -150,7 +191,8 @@ Config lives in `~/.config/mcpx/` (override with `MCPX_CONFIG_DIR`):
 ~/.config/mcpx/
 ├── config.json      # hosts, sync settings
 ├── catalog.json     # your MCP registry
-└── profiles.json    # saved MCP groups
+├── profiles.json    # saved MCP groups
+└── overrides.json   # temporary URL remaps (see Overrides)
 ```
 
 ### config.json

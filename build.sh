@@ -9,6 +9,7 @@ OUT="${SCRIPT_DIR}/mcpx"
 MODULES=(
   lib/core.sh
   lib/fuzzy.sh
+  lib/overrides.sh
   lib/sync.sh
   lib/config.sh
   lib/profiles.sh
@@ -34,6 +35,8 @@ MODULES=(
 #   mcpx :save dev pg ssh-d  save profile
 #   mcpx +dev / -dev         add/remove profile MCPs
 #   mcpx scan [host]         scan host ports for live MCPs
+#   mcpx override <verb>     manage URL overrides (ls/set/rm/clear/from)
+#   mcpx refresh [--walk D]  rewrite .mcp.json URLs per catalog+overrides
 #   mcpx init                initialize config
 #   mcpx hosts               list configured hosts
 #   mcpx sync                show/set sync targets
@@ -88,6 +91,17 @@ Discovery:
   mcpx scan [host]         scan host ports for live MCPs
   mcpx hosts               list configured hosts
 
+Overrides (temporary URL remapping):
+  mcpx override ls                      list active overrides
+  mcpx override set <name> <url>        set override for a catalog entry
+  mcpx override rm <name>                remove an override
+  mcpx override clear                   remove all overrides
+  mcpx override from <host>             scan host, auto-create overrides
+                                        flags: --dry-run, --yes
+  mcpx refresh                          rewrite CWD .mcp.json to match overrides
+  mcpx refresh --walk <dir>             rewrite all .mcp.json under <dir>
+                                        flags: --dry-run, --no-backup
+
 Sync:
   mcpx sync                show sync targets status
   mcpx sync codex true     enable auto-sync to Codex
@@ -127,6 +141,20 @@ case "$1" in
   "?"|ls|list)           cmd_list; exit 0 ;;
   0|clean)               cmd_clean; exit 0 ;;
   scan)                  cmd_scan "${2:-}"; exit 0 ;;
+  refresh)               shift; cmd_refresh "$@"; exit $? ;;
+  override|ov)
+    shift
+    sub="${1:-ls}"
+    [[ $# -gt 0 ]] && shift
+    case "$sub" in
+      ls|list)  cmd_override_ls; exit 0 ;;
+      set)      cmd_override_set "$@"; exit $? ;;
+      rm|del)   cmd_override_rm "$@"; exit $? ;;
+      clear)    cmd_override_clear; exit 0 ;;
+      from)     cmd_override_from "$@"; exit $? ;;
+      *)        die "unknown: override $sub (use ls|set|rm|clear|from)" ;;
+    esac
+    ;;
   sync)
     if [[ $# -ge 3 ]]; then
       cmd_sync_set "$2" "$3"; exit 0

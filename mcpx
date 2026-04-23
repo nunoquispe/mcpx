@@ -14,6 +14,8 @@
 #   mcpx :save dev pg ssh-d  save profile
 #   mcpx +dev / -dev         add/remove profile MCPs
 #   mcpx scan [host]         scan host ports for live MCPs
+#   mcpx override <verb>     manage URL overrides (ls/set/rm/clear/from)
+#   mcpx refresh [--walk D]  rewrite .mcp.json URLs per catalog+overrides
 #   mcpx init                initialize config
 #   mcpx hosts               list configured hosts
 #   mcpx sync                show/set sync targets
@@ -120,6 +122,262 @@ fuzzy_match_current() {
   names=$(jq -r '.mcpServers | keys[]' "$TARGET" 2>/dev/null | sort)
   [[ -n "$names" ]] || die "$TARGET is empty"
   _fuzzy "$1" "$names"
+}
+
+# ============================================================
+# lib/overrides.sh
+# ============================================================
+
+#
+# Overrides let you redirect catalog entries to alternate URLs without
+# touching the catalog. Use case: Mac Mini down, run MCPs locally on
+# different ports. Override resolves before .mcp.json is written.
+
+OVERRIDES="${CONFIG_DIR}/overrides.json"
+
+ensure_overrides() {
+  ensure_config_dir
+  [[ -f "$OVERRIDES" ]] || echo '{}' > "$OVERRIDES"
+}
+
+# has_override NAME → exit 0 if override exists, 1 otherwise
+has_override() {
+  [[ -f "$OVERRIDES" ]] && jq -e --arg n "$1" '.[$n]' "$OVERRIDES" &>/dev/null
+}
+
+# override_url NAME → stdout override URL (empty if none)
+override_url() {
+  [[ -f "$OVERRIDES" ]] || return 0
+  jq -r --arg n "$1" '.[$n] // empty' "$OVERRIDES" 2>/dev/null
+}
+
+# resolve_url NAME → stdout effective URL (override first, catalog fallback)
+resolve_url() {
+  local name="$1" ov
+  ov=$(override_url "$name")
+  if [[ -n "$ov" ]]; then
+    echo "$ov"
+    return
+  fi
+  [[ -f "$CATALOG" ]] || return 0
+  jq -r --arg n "$name" '.mcpServers[$n].url // empty' "$CATALOG"
+}
+
+# Stopwords: tokens that carry no matching signal (common MCP/infra nouns).
+# Used by _match_srvname_to_catalog to filter tokens before fuzzy-matching.
+_SRV_STOPWORDS_RE='^(mcp|server|gm|general|mustard|enterprise|srv|service|svc|app)$'
+
+# Normalize a server name: strip common mcp suffixes/prefixes.
+_normalize_srvname() {
+  local s="$1"
+  s="${s%-mcp-server}"
+  s="${s%_mcp_server}"
+  s="${s%-mcp}"
+  s="${s%_mcp}"
+  s="${s#mcp-}"
+  s="${s#mcp_}"
+  echo "$s"
+}
+
+# Given a server name and catalog names list, return a catalog match or empty.
+# Strategy:
+#   1. Try full normalized name (handles cases like "broccoli-mcp" → "broccoli")
+#   2. Tokenize on -/_, drop stopwords & 1-char tokens
+#   3. Try tokens sorted by length DESC — first unique fuzzy match wins
+# Length-desc bias favors the most distinctive token (e.g. "sapb1" over "sl").
+_match_srvname_to_catalog() {
+  local srv="$1" catalog_list="$2"
+  local norm
+  norm=$(_normalize_srvname "$srv")
+
+  # Round 1: fuzzy on the full normalized name
+  local m
+  m=$(_fuzzy "$norm" "$catalog_list" 2>/dev/null || true)
+  if [[ -n "$m" ]]; then
+    echo "$m"
+    return
+  fi
+
+  # Round 2: tokens sorted by length descending (distinctive first)
+  local tokens
+  tokens=$(echo "$norm" | tr '_-' '\n\n' \
+    | awk -v re="$_SRV_STOPWORDS_RE" 'length($0) >= 2 && !($0 ~ re) { print length, $0 }' \
+    | sort -rn \
+    | awk '{print $2}')
+
+  while IFS= read -r tok; do
+    [[ -z "$tok" ]] && continue
+    local hit
+    hit=$(_fuzzy "$tok" "$catalog_list" 2>/dev/null || true)
+    if [[ -n "$hit" ]]; then
+      echo "$hit"
+      return
+    fi
+  done <<< "$tokens"
+}
+
+cmd_override_ls() {
+  ensure_overrides
+  local count
+  count=$(jq 'length' "$OVERRIDES")
+  if [[ "$count" -eq 0 ]]; then
+    dim "(no overrides)"
+    return
+  fi
+  echo -e "${B}overrides${N} ${D}(${count})${N}"
+  jq -r 'to_entries[] | "\(.key)|\(.value)"' "$OVERRIDES" | while IFS='|' read -r name url; do
+    local catalog_url=""
+    if [[ -f "$CATALOG" ]]; then
+      catalog_url=$(jq -r --arg n "$name" '.mcpServers[$n].url // "(not in catalog)"' "$CATALOG")
+    fi
+    echo -e "  ${C}${name}${N} ${Y}!→${N} ${url}"
+    echo -e "    ${D}catalog: ${catalog_url}${N}"
+  done
+}
+
+cmd_override_set() {
+  ensure_overrides
+  ensure_catalog
+  local name="${1:-}" url="${2:-}"
+  [[ -n "$name" && -n "$url" ]] || die "usage: mcpx override set <name> <url>"
+
+  local resolved
+  resolved=$(fuzzy_match "$name") || return 1
+
+  json_update "$OVERRIDES" --arg k "$resolved" --arg v "$url" '.[$k] = $v'
+  info "override ${C}${resolved}${N} ${Y}!→${N} ${url}"
+  dim "next: mcpx refresh (CWD) or mcpx refresh --walk <dir>"
+}
+
+cmd_override_rm() {
+  ensure_overrides
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "usage: mcpx override rm <name>"
+
+  local names
+  names=$(jq -r 'keys[]' "$OVERRIDES" 2>/dev/null)
+  [[ -n "$names" ]] || die "no overrides to remove"
+
+  local resolved
+  resolved=$(_fuzzy "$name" "$names") || return 1
+
+  json_update "$OVERRIDES" --arg k "$resolved" 'del(.[$k])'
+  echo -e "${R}-${N} override ${resolved}"
+}
+
+cmd_override_clear() {
+  ensure_overrides
+  local count
+  count=$(jq 'length' "$OVERRIDES")
+  if [[ "$count" -eq 0 ]]; then
+    dim "(already empty)"
+    return
+  fi
+  echo '{}' > "$OVERRIDES"
+  info "cleared ${count} override(s)"
+  dim "next: mcpx refresh (CWD) or mcpx refresh --walk <dir>"
+}
+
+# cmd_override_from HOST [--dry-run] [--yes]
+# Scans HOST, fuzzy-matches discovered MCPs against catalog, proposes overrides.
+cmd_override_from() {
+  ensure_overrides
+  ensure_catalog
+
+  local host_name="${1:-}"
+  shift || true
+  local dry_run=0 auto_yes=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry_run=1 ;;
+      --yes|-y)  auto_yes=1 ;;
+      *)         die "unknown flag: $1" ;;
+    esac
+    shift
+  done
+
+  [[ -n "$host_name" ]] || die "usage: mcpx override from <host> [--dry-run] [--yes]"
+  load_host "$host_name"
+
+  echo -e "${B}scanning${N} ${C}${CURRENT_HOST}${N} ${D}${MCP_HOST}:${PORT_MIN}-${PORT_MAX}${N}"
+  echo ""
+
+  local records
+  records=$(probe_host "$MCP_HOST" "$PORT_MIN" "$PORT_MAX")
+
+  if [[ -z "$records" ]]; then
+    warn "no live MCPs on ${CURRENT_HOST}"
+    return 1
+  fi
+
+  local catalog_list
+  catalog_list=$(catalog_names)
+
+  local plan_file unmatched_file
+  plan_file=$(mktemp)
+  unmatched_file=$(mktemp)
+
+  while IFS='|' read -r port srv_name srv_ver tool_count tool_names; do
+    [[ -z "$port" ]] && continue
+    local match
+    match=$(_match_srvname_to_catalog "$srv_name" "$catalog_list")
+
+    local url="http://${MCP_HOST}:${port}/mcp"
+    if [[ -n "$match" ]]; then
+      echo "${match}|${url}|${port}|${srv_name}" >> "$plan_file"
+    else
+      echo "${port}|${srv_name}|${tool_count}" >> "$unmatched_file"
+    fi
+  done <<< "$records"
+
+  local matched_count unmatched_count
+  matched_count=$(wc -l < "$plan_file" | tr -d ' ')
+  unmatched_count=$(wc -l < "$unmatched_file" | tr -d ' ')
+
+  echo -e "${B}proposed overrides${N} ${D}(${matched_count} matched, ${unmatched_count} unmatched)${N}"
+  if [[ "$matched_count" -gt 0 ]]; then
+    while IFS='|' read -r cat url port srv; do
+      echo -e "  ${C}${cat}${N} ${Y}!→${N} ${url} ${D}(${srv})${N}"
+    done < "$plan_file"
+  fi
+  if [[ "$unmatched_count" -gt 0 ]]; then
+    echo ""
+    echo -e "${Y}unmatched${N} ${D}(no catalog fuzzy-match — register with: mcpx @name port)${N}"
+    while IFS='|' read -r port srv tc; do
+      echo -e "  :${port} ${srv} ${D}${tc}t${N}"
+    done < "$unmatched_file"
+  fi
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    echo ""
+    dim "dry-run — no changes made"
+    rm -f "$plan_file" "$unmatched_file"
+    return 0
+  fi
+
+  if [[ "$matched_count" -eq 0 ]]; then
+    warn "nothing to apply"
+    rm -f "$plan_file" "$unmatched_file"
+    return 1
+  fi
+
+  if [[ "$auto_yes" -eq 0 ]]; then
+    echo ""
+    read -rp "Apply ${matched_count} override(s)? [y/N] " ans
+    if ! [[ "$ans" =~ ^[yY]$ ]]; then
+      dim "aborted"
+      rm -f "$plan_file" "$unmatched_file"
+      return 0
+    fi
+  fi
+
+  while IFS='|' read -r cat url port srv; do
+    json_update "$OVERRIDES" --arg k "$cat" --arg v "$url" '.[$k] = $v'
+  done < "$plan_file"
+
+  info "applied ${matched_count} override(s)"
+  dim "next: mcpx refresh (CWD) or mcpx refresh --walk <dir>"
+  rm -f "$plan_file" "$unmatched_file"
 }
 
 # ============================================================
@@ -414,10 +672,13 @@ cmd_show() {
   count=$(echo "$keys" | wc -l | tr -d ' ')
   echo -e "${B}${TARGET}${N} ${D}(${count})${N}"
   echo "$keys" | while read -r k; do
-    local url port
+    local url port marker=""
     url=$(jq -r ".mcpServers[\"$k\"].url" "$TARGET")
     port=$(echo "$url" | grep -oE ':[0-9]+/' | tr -d ':/')
-    echo -e "  ${C}${k}${N} ${D}:${port}${N}"
+    if has_override "$k"; then
+      marker=" ${Y}!${N}"
+    fi
+    echo -e "  ${C}${k}${N} ${D}:${port}${N}${marker}"
   done
 }
 
@@ -431,12 +692,17 @@ cmd_list() {
   total=$(jq '.mcpServers | length' "$CATALOG")
   echo -e "${B}catalog${N} ${D}(${total})${N}"
   catalog_names | while read -r name; do
-    local port
+    local port marker=""
     port=$(jq -r ".mcpServers[\"$name\"].url" "$CATALOG" | grep -oE ':[0-9]+/' | tr -d ':/')
+    if has_override "$name"; then
+      local ov_url
+      ov_url=$(override_url "$name")
+      marker=" ${Y}!→${N} ${D}${ov_url}${N}"
+    fi
     if echo "$active" | grep -qx "$name"; then
-      echo -e "  ${G}*${N} ${C}${name}${N} ${D}:${port}${N}"
+      echo -e "  ${G}*${N} ${C}${name}${N} ${D}:${port}${N}${marker}"
     else
-      echo -e "    ${name} ${D}:${port}${N}"
+      echo -e "    ${name} ${D}:${port}${N}${marker}"
     fi
   done
 }
@@ -458,8 +724,17 @@ cmd_add_single() {
 
   local entry
   entry=$(jq ".mcpServers[\"$resolved\"]" "$CATALOG")
-  json_update "$TARGET" --arg k "$resolved" --argjson v "$entry" '.mcpServers[$k] = $v'
-  info "${resolved}"
+  # Apply URL override if present
+  if has_override "$resolved"; then
+    local ov_url
+    ov_url=$(override_url "$resolved")
+    entry=$(echo "$entry" | jq --arg u "$ov_url" '.url = $u')
+    json_update "$TARGET" --arg k "$resolved" --argjson v "$entry" '.mcpServers[$k] = $v'
+    info "${resolved} ${Y}!${N} ${D}${ov_url}${N}"
+  else
+    json_update "$TARGET" --arg k "$resolved" --argjson v "$entry" '.mcpServers[$k] = $v'
+    info "${resolved}"
+  fi
 }
 
 cmd_rm_single() {
@@ -505,6 +780,112 @@ cmd_clean() {
   auto_sync
 }
 
+# cmd_refresh [--walk DIR] [--dry-run] [--no-backup]
+# Rewrites URLs in .mcp.json file(s) to match resolve_url (override-first, catalog-fallback).
+# Only touches entries whose name is in the catalog; unknown entries are left alone.
+# Default: CWD only. --walk walks a directory tree (skips +archives, node_modules, .git).
+cmd_refresh() {
+  ensure_catalog
+  local dry_run=0 walk_dir="" no_backup=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run)    dry_run=1 ;;
+      --walk)       walk_dir="${2:-}"; [[ -n "$walk_dir" ]] || die "--walk requires a directory"; shift ;;
+      --no-backup)  no_backup=1 ;;
+      *)            die "unknown flag: $1 (use --walk DIR, --dry-run, --no-backup)" ;;
+    esac
+    shift
+  done
+
+  local files=()
+  if [[ -n "$walk_dir" ]]; then
+    [[ -d "$walk_dir" ]] || die "not a directory: $walk_dir"
+    while IFS= read -r f; do
+      case "$f" in
+        */+archives/*|*/node_modules/*|*/.git/*|*/refresh-backup-*/*) continue ;;
+      esac
+      files+=("$f")
+    done < <(find "$walk_dir" -name ".mcp.json" -type f 2>/dev/null)
+  else
+    [[ -f "$TARGET" ]] || die "no $TARGET in $(pwd)"
+    files+=("$TARGET")
+  fi
+
+  if [[ "${#files[@]}" -eq 0 ]]; then
+    warn "no .mcp.json files found"
+    return 1
+  fi
+
+  echo -e "${B}refresh${N} ${D}(${#files[@]} file$([[ ${#files[@]} -gt 1 ]] && echo s))${N}"
+
+  # Backup when rewriting multiple files (walk mode)
+  local bakdir=""
+  if [[ "$dry_run" -eq 0 && "$no_backup" -eq 0 && -n "$walk_dir" ]]; then
+    local ts
+    ts=$(date +%Y%m%d-%H%M%S)
+    bakdir="${CONFIG_DIR}/refresh-backup-${ts}"
+    mkdir -p "$bakdir"
+  fi
+
+  local total_touched=0 total_files_touched=0
+  for f in "${files[@]}"; do
+    local keys
+    keys=$(jq -r '.mcpServers | keys[]?' "$f" 2>/dev/null || true)
+    [[ -z "$keys" ]] && continue
+
+    local changes=()
+    while IFS= read -r k; do
+      jq -e --arg n "$k" '.mcpServers[$n]' "$CATALOG" &>/dev/null || continue
+      local cur exp
+      cur=$(jq -r --arg n "$k" '.mcpServers[$n].url // empty' "$f")
+      exp=$(resolve_url "$k")
+      if [[ -n "$exp" && "$cur" != "$exp" ]]; then
+        changes+=("$k|$cur|$exp")
+      fi
+    done <<< "$keys"
+
+    [[ "${#changes[@]}" -eq 0 ]] && continue
+
+    echo -e "  ${C}${f}${N}"
+    for c in "${changes[@]}"; do
+      IFS='|' read -r k cur exp <<< "$c"
+      echo -e "    ${k} ${D}${cur}${N} → ${exp}"
+    done
+
+    if [[ "$dry_run" -eq 0 ]]; then
+      if [[ -n "$bakdir" ]]; then
+        local rel="${f#/}"
+        mkdir -p "$(dirname "${bakdir}/${rel}")"
+        cp -p "$f" "${bakdir}/${rel}"
+      fi
+      for c in "${changes[@]}"; do
+        IFS='|' read -r k cur exp <<< "$c"
+        json_update "$f" --arg k "$k" --arg u "$exp" '.mcpServers[$k].url = $u'
+      done
+    fi
+
+    total_files_touched=$((total_files_touched + 1))
+    total_touched=$((total_touched + ${#changes[@]}))
+  done
+
+  echo ""
+  if [[ "$total_touched" -eq 0 ]]; then
+    dim "(no changes — already in sync)"
+    return 0
+  fi
+
+  local verb="were"
+  [[ "$dry_run" -eq 1 ]] && verb="would be"
+  echo -e "${D}${total_touched} entries across ${total_files_touched} file(s) ${verb} rewritten${N}"
+  [[ -n "$bakdir" ]] && dim "backup: $bakdir"
+
+  # Auto-sync only in CWD mode (walk mode would thrash codex for every project)
+  if [[ "$dry_run" -eq 0 && -z "$walk_dir" ]]; then
+    auto_sync
+  fi
+}
+
 cmd_catalog_mod() {
   ensure_catalog
   local name="$1"
@@ -542,6 +923,80 @@ cmd_catalog_mod() {
 # ============================================================
 
 
+# probe_host HOST PORT_MIN PORT_MAX
+# → stdout lines: port|srv_name|srv_ver|tool_count|tool_names
+# Used by both cmd_scan (display) and cmd_override_from (matching).
+probe_host() {
+  local host="$1" pmin="$2" pmax="$3"
+
+  # Phase 1: parallel port discovery
+  local tmpdir
+  tmpdir=$(mktemp -d)
+  for port in $(seq "$pmin" "$pmax"); do
+    (
+      # curl -s with -w always prints the code; no `|| echo` fallback
+      # (that was concatenating outputs on connection refused → false positives)
+      local code
+      code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 1 \
+        "http://${host}:${port}/mcp" 2>/dev/null)
+      if [[ -n "$code" && "$code" != "000" ]]; then
+        echo "$port" > "${tmpdir}/${port}"
+      fi
+    ) &
+  done
+  wait
+
+  # Collect live ports
+  local live_ports=()
+  for port in $(seq "$pmin" "$pmax"); do
+    if [[ -f "${tmpdir}/${port}" ]]; then
+      live_ports+=("$port")
+    fi
+  done
+
+  # Phase 2: parallel MCP protocol probe on live ports
+  local probe_dir
+  probe_dir=$(mktemp -d)
+  local init_body='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"mcpx","version":"'"${VERSION}"'"}}}'
+  local tools_body='{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+
+  for port in "${live_ports[@]}"; do
+    (
+      local url="http://${host}:${port}/mcp"
+      local headers="Content-Type: application/json"
+      local accept="Accept: application/json, text/event-stream"
+
+      local init_resp
+      init_resp=$(curl -s -X POST "$url" -H "$headers" -H "$accept" \
+        --max-time 2 -d "$init_body" 2>/dev/null | grep "^data:" | head -1 | sed 's/^data: //')
+
+      local srv_name srv_ver
+      srv_name=$(echo "$init_resp" | jq -r '.result.serverInfo.name // empty' 2>/dev/null)
+      srv_ver=$(echo "$init_resp" | jq -r '.result.serverInfo.version // empty' 2>/dev/null)
+
+      local tools_resp
+      tools_resp=$(curl -s -X POST "$url" -H "$headers" -H "$accept" \
+        --max-time 2 -d "$tools_body" 2>/dev/null | grep "^data:" | head -1 | sed 's/^data: //')
+
+      local tool_count tool_names
+      tool_count=$(echo "$tools_resp" | jq '.result.tools | length' 2>/dev/null || echo "0")
+      tool_names=$(echo "$tools_resp" | jq -r '[.result.tools[].name] | join(",")' 2>/dev/null || echo "")
+
+      echo "${port}|${srv_name:-?}|${srv_ver:-?}|${tool_count:-0}|${tool_names}" > "${probe_dir}/${port}"
+    ) &
+  done
+  wait
+
+  # Emit records in port order
+  for port in "${live_ports[@]}"; do
+    if [[ -f "${probe_dir}/${port}" ]]; then
+      cat "${probe_dir}/${port}"
+    fi
+  done
+
+  rm -rf "$tmpdir" "$probe_dir"
+}
+
 cmd_scan() {
   local host_name="${1:-}"
   load_host "$host_name"
@@ -557,77 +1012,15 @@ cmd_scan() {
   jq -r '.mcpServers | to_entries[] | "\(.value.url | capture("(?<p>[0-9]{4})") | .p)=\(.key)"' \
     "$CATALOG" > "$port_map_file"
 
-  # Phase 1: parallel port discovery
-  local tmpdir
-  tmpdir=$(mktemp -d)
-  for port in $(seq "$PORT_MIN" "$PORT_MAX"); do
-    (
-      # curl -s with -w always prints the code; no `|| echo` fallback
-      # (that was concatenating outputs on connection refused → false positives)
-      local code
-      code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 1 \
-        "http://${MCP_HOST}:${port}/mcp" 2>/dev/null)
-      if [[ -n "$code" && "$code" != "000" ]]; then
-        echo "$port" > "${tmpdir}/${port}"
-      fi
-    ) &
-  done
-  wait
+  local records
+  records=$(probe_host "$MCP_HOST" "$PORT_MIN" "$PORT_MAX")
 
-  # Collect live ports
-  local live_ports=()
-  for port in $(seq "$PORT_MIN" "$PORT_MAX"); do
-    if [[ -f "${tmpdir}/${port}" ]]; then
-      live_ports+=("$port")
-    fi
-  done
+  local found=0 new=0
+  while IFS='|' read -r port srv_name srv_ver tool_count tool_names; do
+    [[ -z "$port" ]] && continue
 
-  # Phase 2: parallel MCP protocol probe on live ports
-  local probe_dir
-  probe_dir=$(mktemp -d)
-  local init_body='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"mcpx","version":"'"${VERSION}"'"}}}'
-  local tools_body='{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
-
-  for port in "${live_ports[@]}"; do
-    (
-      local url="http://${MCP_HOST}:${port}/mcp"
-      local headers="Content-Type: application/json"
-      local accept="Accept: application/json, text/event-stream"
-
-      # Initialize → server name + version
-      local init_resp
-      init_resp=$(curl -s -X POST "$url" -H "$headers" -H "$accept" \
-        --max-time 2 -d "$init_body" 2>/dev/null | grep "^data:" | head -1 | sed 's/^data: //')
-
-      local srv_name srv_ver
-      srv_name=$(echo "$init_resp" | jq -r '.result.serverInfo.name // empty' 2>/dev/null)
-      srv_ver=$(echo "$init_resp" | jq -r '.result.serverInfo.version // empty' 2>/dev/null)
-
-      # tools/list → tool count and names
-      local tools_resp
-      tools_resp=$(curl -s -X POST "$url" -H "$headers" -H "$accept" \
-        --max-time 2 -d "$tools_body" 2>/dev/null | grep "^data:" | head -1 | sed 's/^data: //')
-
-      local tool_count tool_names
-      tool_count=$(echo "$tools_resp" | jq '.result.tools | length' 2>/dev/null || echo "0")
-      tool_names=$(echo "$tools_resp" | jq -r '[.result.tools[].name] | join(",")' 2>/dev/null || echo "")
-
-      echo "${srv_name:-?}|${srv_ver:-?}|${tool_count:-0}|${tool_names}" > "${probe_dir}/${port}"
-    ) &
-  done
-  wait
-
-  # Display results
-  local found=0
-  local new=0
-  for port in "${live_ports[@]}"; do
     local known_name=""
     known_name=$(grep "^${port}=" "$port_map_file" | cut -d= -f2 || true)
-
-    local srv_name="?" srv_ver="?" tool_count="0" tool_names=""
-    if [[ -f "${probe_dir}/${port}" ]]; then
-      IFS='|' read -r srv_name srv_ver tool_count tool_names < "${probe_dir}/${port}"
-    fi
 
     local tools_display=""
     if [[ -n "$tool_names" && "$tool_names" != "null" ]]; then
@@ -641,8 +1034,9 @@ cmd_scan() {
       new=$((new + 1))
     fi
     found=$((found + 1))
-  done
-  rm -rf "$tmpdir" "$probe_dir" "$port_map_file"
+  done <<< "$records"
+
+  rm -f "$port_map_file"
 
   echo ""
   echo -e "${D}${found} live, ${new} unknown${N}"
@@ -681,6 +1075,17 @@ Catalog:
 Discovery:
   mcpx scan [host]         scan host ports for live MCPs
   mcpx hosts               list configured hosts
+
+Overrides (temporary URL remapping):
+  mcpx override ls                      list active overrides
+  mcpx override set <name> <url>        set override for a catalog entry
+  mcpx override rm <name>                remove an override
+  mcpx override clear                   remove all overrides
+  mcpx override from <host>             scan host, auto-create overrides
+                                        flags: --dry-run, --yes
+  mcpx refresh                          rewrite CWD .mcp.json to match overrides
+  mcpx refresh --walk <dir>             rewrite all .mcp.json under <dir>
+                                        flags: --dry-run, --no-backup
 
 Sync:
   mcpx sync                show sync targets status
@@ -721,6 +1126,20 @@ case "$1" in
   "?"|ls|list)           cmd_list; exit 0 ;;
   0|clean)               cmd_clean; exit 0 ;;
   scan)                  cmd_scan "${2:-}"; exit 0 ;;
+  refresh)               shift; cmd_refresh "$@"; exit $? ;;
+  override|ov)
+    shift
+    sub="${1:-ls}"
+    [[ $# -gt 0 ]] && shift
+    case "$sub" in
+      ls|list)  cmd_override_ls; exit 0 ;;
+      set)      cmd_override_set "$@"; exit $? ;;
+      rm|del)   cmd_override_rm "$@"; exit $? ;;
+      clear)    cmd_override_clear; exit 0 ;;
+      from)     cmd_override_from "$@"; exit $? ;;
+      *)        die "unknown: override $sub (use ls|set|rm|clear|from)" ;;
+    esac
+    ;;
   sync)
     if [[ $# -ge 3 ]]; then
       cmd_sync_set "$2" "$3"; exit 0
