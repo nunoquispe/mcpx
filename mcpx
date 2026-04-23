@@ -1133,19 +1133,43 @@ _catalog_upsert() {
 
 # JSON-RPC request bodies used in phase 2 of probe_host.
 _MCP_INIT_BODY='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"mcpx","version":"__VER__"}}}'
+_MCP_INITIALIZED_BODY='{"jsonrpc":"2.0","method":"notifications/initialized"}'
 _MCP_TOOLS_BODY='{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
 
-# _mcp_post <url> <body> → the first `data:` SSE payload, or empty.
+# _mcp_post <url> <body> [<session_id>] → the first `data:` SSE payload, or empty.
 # MCP servers respond with text/event-stream for these methods; we take
-# the first `data:` line as the JSON-RPC response body.
+# the first `data:` line as the JSON-RPC response body. When session_id is
+# provided, it is sent as the Mcp-Session-Id header (required for any call
+# after `initialize` on the Streamable HTTP transport).
 _mcp_post() {
-  local url="$1" body="$2"
-  curl -s -X POST "$url" \
+  local url="$1" body="$2" sid="${3:-}"
+  local args=(-s -X POST "$url"
+       -H "Content-Type: application/json"
+       -H "Accept: application/json, text/event-stream"
+       --max-time 2
+       -d "$body")
+  [[ -n "$sid" ]] && args+=(-H "Mcp-Session-Id: $sid")
+  curl "${args[@]}" 2>/dev/null \
+    | awk '/^data:/ { sub(/^data: */, ""); print; exit }'
+}
+
+# _mcp_init <url> → "<session_id>|<body>" (either may be empty on failure).
+# Performs the initial handshake while capturing the Mcp-Session-Id header
+# that the server returns. The body is the first `data:` SSE payload.
+_mcp_init() {
+  local url="$1"
+  local hdr_file body sid
+  hdr_file=$(mktemp)
+  body=$(curl -s -D "$hdr_file" -X POST "$url" \
        -H "Content-Type: application/json" \
        -H "Accept: application/json, text/event-stream" \
        --max-time 2 \
-       -d "$body" 2>/dev/null \
-    | awk '/^data:/ { sub(/^data: */, ""); print; exit }'
+       -d "${_MCP_INIT_BODY/__VER__/$VERSION}" 2>/dev/null \
+    | awk '/^data:/ { sub(/^data: */, ""); print; exit }')
+  sid=$(awk 'tolower($1) == "mcp-session-id:" { print $2; exit }' "$hdr_file" \
+    | tr -d '\r\n')
+  rm -f "$hdr_file"
+  echo "${sid}|${body}"
 }
 
 # probe_host <host> <pmin> <pmax>
@@ -1177,24 +1201,57 @@ probe_host() {
   done
 
   # Phase 2: MCP protocol handshake on each live port (parallel).
+  #
+  # Streamable HTTP transport requires a stateful session:
+  #   1. POST initialize             → server returns Mcp-Session-Id header
+  #   2. POST notifications/initialized (with Mcp-Session-Id)
+  #   3. POST tools/list             (with Mcp-Session-Id)
+  #   4. DELETE /mcp                 (with Mcp-Session-Id)  — best-effort cleanup
+  #
+  # Skipping steps 1–2 makes the server return -32000 "not initialized" and
+  # tool_count silently collapses to 0.
   local probe_dir
   probe_dir=$(make_tempdir)
 
-  # Bake the running version into the clientInfo once, up front.
-  local init_body="${_MCP_INIT_BODY/__VER__/$VERSION}"
-
   for port in "${live_ports[@]}"; do
     (
-      local url init_resp tools_resp srv_name srv_ver tool_count tool_names
+      # Disable errexit inside the probe subshell — partial failures (jq on
+      # an empty body, a slow port that times out) must NOT abort the whole
+      # scan. We always emit a record, even if some fields end up as '?'.
+      set +e
+      local url init_pair sid init_resp tools_resp
+      local srv_name srv_ver tool_count tool_names
       url=$(build_mcp_url "$host" "$port")
 
-      init_resp=$(_mcp_post  "$url" "$init_body")
-      tools_resp=$(_mcp_post "$url" "$_MCP_TOOLS_BODY")
+      init_pair=$(_mcp_init "$url")
+      sid="${init_pair%%|*}"
+      init_resp="${init_pair#*|}"
 
-      srv_name=$(jq -r '.result.serverInfo.name    // empty' <<<"$init_resp" 2>/dev/null)
-      srv_ver=$(jq  -r '.result.serverInfo.version // empty' <<<"$init_resp" 2>/dev/null)
-      tool_count=$(jq   '.result.tools | length'    <<<"$tools_resp" 2>/dev/null || echo 0)
-      tool_names=$(jq -r '[.result.tools[].name] | join(",")' <<<"$tools_resp" 2>/dev/null || echo "")
+      # Notify initialized (server expects this before any other call). No
+      # response body — we only need it to advance the session state machine.
+      if [[ -n "$sid" ]]; then
+        curl -s -X POST "$url" \
+             -H "Content-Type: application/json" \
+             -H "Accept: application/json, text/event-stream" \
+             -H "Mcp-Session-Id: $sid" \
+             --max-time 2 \
+             -d "$_MCP_INITIALIZED_BODY" >/dev/null 2>&1
+      fi
+
+      tools_resp=$(_mcp_post "$url" "$_MCP_TOOLS_BODY" "$sid")
+
+      srv_name=$(jq   -r '.result.serverInfo.name    // empty' <<<"$init_resp"  2>/dev/null)
+      srv_ver=$(jq    -r '.result.serverInfo.version // empty' <<<"$init_resp"  2>/dev/null)
+      tool_count=$(jq    '.result.tools | length'             <<<"$tools_resp" 2>/dev/null)
+      tool_names=$(jq -r '[.result.tools[].name] | join(",")' <<<"$tools_resp" 2>/dev/null)
+
+      # Best-effort: tell the server to drop the session so it doesn't
+      # accumulate idle handshakes from repeated scans.
+      if [[ -n "$sid" ]]; then
+        curl -s -X DELETE "$url" \
+             -H "Mcp-Session-Id: $sid" \
+             --max-time 1 >/dev/null 2>&1
+      fi
 
       echo "${port}|${srv_name:-?}|${srv_ver:-?}|${tool_count:-0}|${tool_names}" \
         > "${probe_dir}/${port}"
@@ -1202,10 +1259,13 @@ probe_host() {
   done
   wait
 
-  # Emit records in port order.
+  # Emit records in port order. The `|| true` keeps the loop's final exit
+  # status at 0 even when a probe file is missing — otherwise `set -e` in
+  # the caller's command substitution aborts the whole scan.
   for port in "${live_ports[@]}"; do
     [[ -f "${probe_dir}/${port}" ]] && cat "${probe_dir}/${port}"
   done
+  return 0
 }
 
 # --- commands -------------------------------------------------------------
@@ -1235,7 +1295,10 @@ cmd_scan() {
   while IFS='|' read -r port srv_name srv_ver tool_count tool_names; do
     [[ -z "$port" ]] && continue
 
-    known=$(grep "^${port}=" <<<"$port_map" | head -1 | cut -d= -f2-)
+    # `|| true` keeps `set -e` happy when the port has no catalog entry —
+    # grep returning 1 (no match) is the normal "unknown port" case, not an
+    # error. Without this guard the entire scan aborts at the first new port.
+    known=$(grep "^${port}=" <<<"$port_map" | head -1 | cut -d= -f2- || true)
 
     tools_display=""
     if [[ -n "$tool_names" && "$tool_names" != "null" ]]; then
