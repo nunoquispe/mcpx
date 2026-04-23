@@ -562,10 +562,12 @@ cmd_scan() {
   tmpdir=$(mktemp -d)
   for port in $(seq "$PORT_MIN" "$PORT_MAX"); do
     (
+      # curl -s with -w always prints the code; no `|| echo` fallback
+      # (that was concatenating outputs on connection refused → false positives)
       local code
       code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 1 \
-        "http://${MCP_HOST}:${port}/mcp" 2>/dev/null || echo "000")
-      if [[ "$code" != "000" ]]; then
+        "http://${MCP_HOST}:${port}/mcp" 2>/dev/null)
+      if [[ -n "$code" && "$code" != "000" ]]; then
         echo "$port" > "${tmpdir}/${port}"
       fi
     ) &
