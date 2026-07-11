@@ -19,24 +19,27 @@ Tools like [mcpm](https://mcpm.sh) and [mcp-get](https://github.com/michaellatma
 - **Fuzzy matching** — `pg` → `pg-enterprise`, `ssh-d` → `ssh-dev`
 - **Port scanning** — discover live MCPs with server info and tool lists
 - **Profiles** — group MCPs and add/remove them as a set
-- **Multi-client sync** — auto-sync to Codex (and more coming)
-- **Zero dependencies** — just bash, jq, and curl
+- **Multi-client sync** — auto-sync to Gemini and Codex (and more coming)
+- **Single static binary** — compiled with Bun; no runtime, no jq/curl needed
 
 ## Install
 
 ```bash
-# Option 1: Homebrew
+# Option 1: Homebrew (builds from source)
 brew install nunoquispe/tap/mcpx
 
-# Option 2: curl
-curl -fsSL https://raw.githubusercontent.com/nunoquispe/mcpx/main/install.sh | bash
-
-# Option 3: manual
-curl -fsSL https://raw.githubusercontent.com/nunoquispe/mcpx/main/mcpx -o /usr/local/bin/mcpx
+# Option 2: prebuilt binary (macOS/Linux) from GitHub Releases
+curl -fsSL "https://github.com/nunoquispe/mcpx/releases/latest/download/mcpx-$(uname -s)-$(uname -m)" -o /usr/local/bin/mcpx
 chmod +x /usr/local/bin/mcpx
+
+# Option 3: build from source (requires Bun)
+git clone https://github.com/nunoquispe/mcpx
+cd mcpx && bun install && bun run build
+cp ./mcpx /usr/local/bin/mcpx
 ```
 
-**Requirements:** `jq` and `curl` (both pre-installed on macOS).
+**Runtime requirements:** none — `mcpx` is a self-contained binary. Building from
+source needs [Bun](https://bun.sh).
 
 ## Quick start
 
@@ -166,8 +169,9 @@ Auto-sync your `.mcp.json` to other AI coding tools:
 
 ```bash
 mcpx sync                # show sync status
+mcpx sync gemini true    # enable auto-sync to .gemini/settings.json
 mcpx sync codex true     # enable auto-sync to ~/.codex/config.toml
-mcpx sync codex false    # disable
+mcpx sync gemini false   # disable
 ```
 
 When enabled, every `+`, `-`, and `0` operation automatically updates the target config.
@@ -230,23 +234,26 @@ Config lives in `~/.config/mcpx/` (override with `MCPX_CONFIG_DIR`):
 
 ```
 mcpx/
-├── mcpx             # distributable script (built from lib/)
-├── build.sh         # assembles lib/*.sh → mcpx
-├── lib/
-│   ├── core.sh      # constants, colors, shared helpers (paths, json, url, tempdir)
-│   ├── fuzzy.sh     # fuzzy name matching (literal-string safe)
-│   ├── overrides.sh # temporary URL remapping (override-first resolution)
-│   ├── sync.sh      # auto-sync to external clients (Codex today)
-│   ├── config.sh    # init, hosts, load_host → HOST_* globals
-│   ├── profiles.sh  # named groups of MCPs
-│   ├── catalog.sh   # show/list/add/remove/refresh/catalog edit
-│   └── scan.sh      # parallel port scan + MCP handshake
+├── src/
+│   ├── mcpx.ts      # entry + command router
+│   ├── core.ts      # constants, colors, shared helpers (paths, json, url, prompts)
+│   ├── fuzzy.ts     # fuzzy name matching (literal-string safe)
+│   ├── overrides.ts # temporary URL remapping (override-first resolution)
+│   ├── sync.ts      # auto-sync to external clients (Codex, Gemini)
+│   ├── config.ts    # init, hosts, loadHost → resolved Host
+│   ├── profiles.ts  # named groups of MCPs
+│   ├── catalog.ts   # show/list/add/remove/refresh/catalog edit
+│   └── scan.ts      # parallel HTTP probe + MCP handshake (fetch/SSE)
+├── package.json     # `bun run build` → compiles the `mcpx` binary
+├── tsconfig.json
 ├── install.sh       # curl installer
 ├── README.md
 └── LICENSE
 ```
 
-Development: edit files in `lib/`, then run `./build.sh` to rebuild the distributable `mcpx`.
+Development: edit files in `src/`, run `bun run dev <args>` to execute from
+source, `bun run typecheck` to run `tsc`, and `bun run build` to compile the
+`mcpx` binary.
 
 ## How it works
 
