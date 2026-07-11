@@ -24,22 +24,16 @@ Tools like [mcpm](https://mcpm.sh) and [mcp-get](https://github.com/michaellatma
 
 ## Install
 
+Build from source (requires [Bun](https://bun.sh)):
+
 ```bash
-# Option 1: Homebrew (builds from source)
-brew install nunoquispe/tap/mcpx
-
-# Option 2: prebuilt binary (macOS/Linux) from GitHub Releases
-curl -fsSL "https://github.com/nunoquispe/mcpx/releases/latest/download/mcpx-$(uname -s)-$(uname -m)" -o /usr/local/bin/mcpx
-chmod +x /usr/local/bin/mcpx
-
-# Option 3: build from source (requires Bun)
 git clone https://github.com/nunoquispe/mcpx
 cd mcpx && bun install && bun run build
 cp ./mcpx /usr/local/bin/mcpx
 ```
 
-**Runtime requirements:** none — `mcpx` is a self-contained binary. Building from
-source needs [Bun](https://bun.sh).
+`bun run build` compiles a self-contained binary — the resulting `mcpx` has no
+runtime dependencies (no Bun, jq, or curl needed to run it).
 
 ## Quick start
 
